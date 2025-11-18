@@ -54,11 +54,3 @@ general:
   #   pip_install_command.format(package="X")
   auto_install_missing_packages_default: true
   pip_install_command: "pip install {package}"
-  max_rounds: 1
-
-  # Agent bağlamı için:
-  max_files_in_tree: 150      # LLM'e göstereceğimiz max dosya sayısı
-  max_preview_bytes_per_file: 2000  # İstersek ileride içerik de ekleriz (şimdilik kullanılmıyor)
-
-  # Varsayılan davranış: gerçek dosya yaz / sadece simülasyon
-  dry_run_default: false
