@@ -1,0 +1,33 @@
+# otonom_coder.config.yaml
+
+# Varsayılan çalışma modu:
+# - "cloud"  → qwen3-coder:480b-cloud
+# - "local"  → yerel coder modelin (örn. qwen2.5-coder)
+mode: cloud
+
+cloud:
+  host: "http://localhost:11434"
+  model: "qwen3-coder:480b-cloud"
+
+local:
+  host: "http://localhost:11434"
+  model: "qwen2.5-coder:32b"
+
+general:
+  # Web UI'de boş bırakılırsa kullanılacak workspace
+  default_workspace: "./workspace"
+
+  # LLM ayarları
+  temperature: 0.1
+
+  # max_rounds:
+  #   1  → sadece direkt "dosya aksiyonu üret" (eski model)
+  #   2+ → önce PLAN, sonra dosya aksiyonu (plan → apply)
+  max_rounds: 2
+
+  # Agent bağlamı için:
+  max_files_in_tree: 150            # LLM'e göstereceğimiz max dosya sayısı
+  max_preview_bytes_per_file: 2000  # (şimdilik kullanılmıyor, ileride içerik ekleriz)
+
+  # Varsayılan davranış: gerçek dosya yaz / sadece simülasyon
+  dry_run_default: false
