@@ -1,46 +1,18 @@
 #!/usr/bin/env python
 """
-Qwen3-Coder + Ollama ile otonom coder agent (plan → apply + test fix + format/lint + review, v5).
-
-Özellikler:
-- Config'i okur
-- Workspace hafızasını (.otonom_memory.md) prompt'a ekler
-- PLAN turu (max_rounds >= 2 ise)
-- CODER turu (dosya aksiyonları üretir)
-- Dosyaları yazar/siler (dry-run destekli)
-- Format komutu (ör. black) çalıştırır
-- Lint komutu (ör. ruff) çalıştırır
-- Test komutunu (ör. pytest) çalıştırır
-- Test fail olursa:
-    - Hata logunu modele verir
-    - Yeni bir dosya aksiyonu turu ister
-    - Dosyaları günceller
-    - Testleri tekrar çalıştırır (max_test_fix_rounds kadar)
-- Reviewer agent:
-    - Değişiklikleri ve projeyi gözden geçirir, yorum üretir
-- Plan + aksiyon + format/lint + test + review özetini string olarak döndürür
+Qwen3-Coder + Ollama ile otonom coder agent
+(plan → apply + test fix + format/lint + review + auto pip install, v6).
 """
 
 import json
+import re
 import subprocess
-Qwen3-Coder + Ollama ile otonom coder agent (v2).
-
-Bu modül:
-- Config'i okur
-- Qwen3-Coder'a prompt atar
-- JSON formatında dosya aksiyonları alır
-- İstenirse workspace içinde dosyaları GERÇEKTEN yazar/siler (dry-run destekli)
-- Özet string döndürür (web UI'de chat mesajı olarak gösterilecek)
-"""
-
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from ollama import Client  # type: ignore
-
 
 # Workspace hafıza dosyası ismi
 MEMORY_FILENAME = ".otonom_memory.md"
@@ -72,6 +44,8 @@ class GeneralConfig:
     format_command: str
     run_lint_default: bool
     lint_command: str
+    auto_install_missing_packages_default: bool
+    pip_install_command: str
 
 
 @dataclass
@@ -107,7 +81,6 @@ def load_config(config_path: Path) -> AppConfig:
         default_workspace=str(general_raw.get("default_workspace", "./workspace")),
         temperature=float(general_raw.get("temperature", 0.1)),
         max_rounds=int(general_raw.get("max_rounds", 2)),
-        max_rounds=int(general_raw.get("max_rounds", 1)),
         max_files_in_tree=int(general_raw.get("max_files_in_tree", 150)),
         max_preview_bytes_per_file=int(
             general_raw.get("max_preview_bytes_per_file", 2000)
@@ -121,6 +94,12 @@ def load_config(config_path: Path) -> AppConfig:
         format_command=str(general_raw.get("format_command", "black .")),
         run_lint_default=bool(general_raw.get("run_lint_default", False)),
         lint_command=str(general_raw.get("lint_command", "ruff .")),
+        auto_install_missing_packages_default=bool(
+            general_raw.get("auto_install_missing_packages_default", True)
+        ),
+        pip_install_command=str(
+            general_raw.get("pip_install_command", "pip install {package}")
+        ),
     )
 
     return AppConfig(mode=mode, cloud=cloud, local=local, general=general)
@@ -134,10 +113,6 @@ def select_endpoint(cfg: AppConfig, override_mode: Optional[str] = None) -> Mode
 
 
 def get_workspace_overview(workspace: Path, max_files: int) -> str:
-    """
-    Workspace içindeki dosya ağacını kısa bir metin olarak çıkar.
-    Modeller için bağlam verir.
-    """
     items: List[str] = []
     for p in workspace.rglob("*"):
         if p.is_file():
@@ -151,9 +126,6 @@ def get_workspace_overview(workspace: Path, max_files: int) -> str:
 
 
 def load_workspace_memory(workspace: Path) -> str:
-    """
-    Workspace hafıza dosyasını (.otonom_memory.md) okur.
-    """
     mem_file = workspace / MEMORY_FILENAME
     if mem_file.exists():
         try:
@@ -191,14 +163,14 @@ You must output a single Markdown JSON code block describing the plan:
     }
   ]
 }
-```
+````
 
 Rules:
 
 * "path" MUST be relative to the workspace root (no .., no absolute paths).
 * You MUST return valid JSON (no comments, no trailing commas).
 * Outside the `json ... ` block you MUST NOT output anything.
-"""
+  """
 
 def build_planner_messages(task: str, workspace: Path, cfg: AppConfig) -> List[Dict[str, Any]]:
     file_tree = get_workspace_overview(workspace, cfg.general.max_files_in_tree)
@@ -223,7 +195,9 @@ def build_planner_messages(task: str, workspace: Path, cfg: AppConfig) -> List[D
 
 
 # ---------------------------------------------------------------------------
+
 # CODER PROMPT
+
 # ---------------------------------------------------------------------------
 
 CODER_SYSTEM_PROMPT = """
@@ -234,17 +208,6 @@ You ONLY work inside a given workspace directory and you have FULL control over 
 * You can create, overwrite, and delete files.
 * You must ALWAYS write full file contents (never patches, never diffs).
 * Prefer the simplest, most robust solution.
-# ---------------------------------------------------------------------------
-# Prompt & LLM çağrısı
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = """
-You are an autonomous coding agent similar to Claude Coder / OpenAI Codex.
-
-You ONLY work inside a given workspace directory and you have FULL control over files:
-- You can create, overwrite, and delete files.
-- You must ALWAYS write full file contents (never patches, never diffs).
-- Prefer the simplest, most robust solution.
 
 ### GOAL
 
@@ -263,14 +226,6 @@ You must:
 2. If failure info is provided, focus on fixing the failure while preserving existing working code as much as possible.
 3. Decide the minimal set of files to create/update/delete to complete the task.
 4. Output a JSON array describing the file operations.
-- A natural language task.
-- The absolute path of the workspace directory.
-- A file tree overview of the current workspace (relative paths).
-
-You must:
-1. Understand the task.
-2. Decide the minimal set of files to create/update/delete to complete the task.
-3. Output a JSON array describing the file operations.
 
 ### FILE OPERATIONS FORMAT
 
@@ -350,7 +305,9 @@ def build_coder_messages(
 
 
 # ---------------------------------------------------------------------------
+
 # REVIEWER PROMPT
+
 # ---------------------------------------------------------------------------
 
 REVIEWER_SYSTEM_PROMPT = """
@@ -374,7 +331,7 @@ Your job:
   * Simple refactor suggestions (if any)
 * Do NOT output code, do NOT output JSON.
 * Answer in natural language Markdown (bullet points welcome).
-"""
+  """
 
 def build_reviewer_messages(
     task: str,
@@ -401,24 +358,6 @@ def build_reviewer_messages(
     if memory_text.strip():
         memory_part = "\n\nWorkspace memory:\n" + memory_text + "\n"
 
-def get_workspace_overview(workspace: Path, max_files: int) -> str:
-    """
-    Workspace içindeki dosya ağacını kısa bir metin olarak çıkar.
-    Modeller için bağlam verir.
-    """
-    items: List[str] = []
-    for p in workspace.rglob("*"):
-        if p.is_file():
-            rel = p.relative_to(workspace)
-            items.append(str(rel))
-        if len(items) >= max_files:
-            break
-    if not items:
-        return "(empty workspace)"
-    return "\n".join(items)
-
-def build_messages(task: str, workspace: Path, cfg: AppConfig) -> List[Dict[str, Any]]:
-    file_tree = get_workspace_overview(workspace, cfg.general.max_files_in_tree)
     user_content = (
         "Workspace absolute path:\n"
         f"{str(workspace.resolve())}\n\n"
@@ -433,18 +372,14 @@ def build_messages(task: str, workspace: Path, cfg: AppConfig) -> List[Dict[str,
 
     return [
         {"role": "system", "content": REVIEWER_SYSTEM_PROMPT.strip()},
-        f"{file_tree}\n\n"
-        "Task:\n"
-        f"{task}"
-    )
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT.strip()},
         {"role": "user", "content": user_content},
     ]
 
 
 # ---------------------------------------------------------------------------
+
 # LLM çağrısı / JSON blok çıkarma
+
 # ---------------------------------------------------------------------------
 
 def call_llm(
@@ -458,21 +393,11 @@ def call_llm(
         messages=messages,
         options={"temperature": float(temperature)},
     )
-    # Ollama python client dict döndürür: {"message": {"content": "..."}}
     return response["message"]["content"]  # type: ignore[index]
 
-# ---------------------------------------------------------------------------
-# JSON blok ayıklama & dosya işlemleri
-# ---------------------------------------------------------------------------
-
 def extract_json_block(text: str) -> str:
-    """
-    Model çıktısından `json ... ` bloğunu çek.
-    Eğer yoksa tüm metni JSON sanıp parse etmeyi deneriz.
-    """
     start_token = "```json"
     end_token = "```"
-
     start_idx = text.find(start_token)
     if start_idx == -1:
         return text.strip()
@@ -486,13 +411,12 @@ def extract_json_block(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+
 # Dosya güvenliği ve uygulama
+
 # ---------------------------------------------------------------------------
 
 def ensure_path_in_workspace(workspace: Path, target: Path) -> None:
-    """
-    path traversal engelle: workspace dışına çıkmasın.
-    """
     workspace_resolved = workspace.resolve()
     target_resolved = target.resolve()
     if workspace_resolved == target_resolved:
@@ -501,9 +425,6 @@ def ensure_path_in_workspace(workspace: Path, target: Path) -> None:
         raise ValueError(f"Workspace dışı path reddedildi: {target_resolved}")
 
 def apply_file_actions(actions: List[Dict[str, Any]], workspace: Path) -> List[str]:
-    """
-    Dosya işlemlerini uygular ve kısa log satırları döner.
-    """
     logs: List[str] = []
 
     for action in actions:
@@ -541,9 +462,10 @@ def parse_actions(json_text: str) -> List[Dict[str, Any]]:
         return data["files"]
     raise ValueError("Beklenen format bir JSON listesi veya {'files': [...]} olmalı.")
 
-
 # ---------------------------------------------------------------------------
+
 # Komut çalıştırma (format, lint, test, manuel)
+
 # ---------------------------------------------------------------------------
 
 def run_tests(
@@ -551,9 +473,6 @@ def run_tests(
     command: str,
     timeout_seconds: int,
 ) -> Tuple[int, str, str]:
-    """
-    Test komutunu çalıştırır, (returncode, stdout, stderr) döner.
-    """
     try:
         proc = subprocess.run(
             command,
@@ -579,11 +498,7 @@ def summarize_test_result(
     stderr: str,
     command: str,
 ) -> str:
-    """
-    Test sonucunu kısa bir metin olarak özetler.
-    """
     max_len = 2000
-
     def cut(s: str) -> str:
         return s[:max_len] + ("..." if len(s) > max_len else "")
 
@@ -609,9 +524,6 @@ def run_generic_command(
     command: str,
     timeout_seconds: int,
 ) -> Tuple[int, str, str]:
-    """
-    Genel amaçlı shell komutu çalıştır (format/lint/manual).
-    """
     try:
         proc = subprocess.run(
             command,
@@ -638,11 +550,7 @@ def summarize_generic_command_result(
     stderr: str,
     command: str,
 ) -> str:
-    """
-    Genel amaçlı komut sonucu özetleyici (format/lint/manual).
-    """
     max_len = 2000
-
     def cut(s: str) -> str:
         return s[:max_len] + ("..." if len(s) > max_len else "")
 
@@ -664,13 +572,27 @@ def summarize_generic_command_result(
 
 
 # ---------------------------------------------------------------------------
+
+# ModuleNotFoundError yakalayıcı
+
+# ---------------------------------------------------------------------------
+
+def extract_missing_module_name(stdout: str, stderr: str) -> Optional[str]:
+    text = stdout + "\n" + stderr
+    m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"%22]+)['\"]", text)
+    if not m:
+        return None
+    return m.group(1)
+
+# ---------------------------------------------------------------------------
+
 # Özetleyiciler
+
 # ---------------------------------------------------------------------------
 
 def summarize_plan(plan_obj: Optional[Dict[str, Any]], raw_json_text: str) -> str:
     if plan_obj is None:
         return "Plan JSON ayrıştırılamadı, coder doğrudan görev üzerinden karar verdi."
-
     summary = plan_obj.get("summary")
     files = plan_obj.get("files")
 
@@ -708,21 +630,11 @@ def summarize_actions(
     dry_run: bool = False,
     header_prefix: str = "",
 ) -> str:
-    """
-    Dosya aksiyonlarını insan-diliyle özetle.
-    """
     if not actions:
         base = "Herhangi bir dosya değişikliği planlanmadı."
         if dry_run:
             base = "🟡 DRY-RUN (dosyalara dokunulmadı)\n\n" + base
         return (header_prefix + "\n" if header_prefix else "") + base
-) -> str:
-    """
-    Web chat'te gösterilecek kısa özet.
-    """
-    if not actions:
-        return "Herhangi bir dosya değişikliği gerekmedi."
-
     write_count = 0
     delete_count = 0
     lines: List[str] = []
@@ -749,9 +661,6 @@ def summarize_actions(
         if dry_run
         else f"{write_count} dosya yazıldı, {delete_count} dosya silindi."
     )
-    header = f"{write_count} dosya yazılacak, {delete_count} dosya silinecek."
-    if not dry_run:
-        header = f"{write_count} dosya yazıldı, {delete_count} dosya silindi."
 
     result = header + "\n" + "\n".join(lines)
 
@@ -770,8 +679,9 @@ def summarize_actions(
 
 
 # ---------------------------------------------------------------------------
-# Planner + Coder + Format/Lint + Test + Review ana fonksiyon
-# Dışarı açılan ana fonksiyon
+
+# Planner + Coder + Format/Lint + Test + Auto-Pip + Review
+
 # ---------------------------------------------------------------------------
 
 def run_agent_round(
@@ -786,22 +696,11 @@ def run_agent_round(
     format_command_override: Optional[str] = None,
     run_lint_flag: Optional[bool] = None,
     lint_command_override: Optional[str] = None,
+    run_auto_install_flag: Optional[bool] = None,
+    pip_install_command_override: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Tek user görevi için tam pipeline:
-    - İsteğe bağlı PLAN turu (max_rounds >= 2 ise)
-    - CODER turu (dosya aksiyonlarını üretir)
-    - İstenirse aksiyonları workspace'e uygular
-    - İstenirse format ve lint komutlarını çalıştırır
-    - İstenirse test komutunu çalıştırır
-        - Test fail olursa, hata logunu modele verip yeni aksiyon isteyerek düzeltmeye çalışır
-    - Reviewer agent ile code review çıktısı üretir
-    - Tüm aksiyonları ve birleşik özet metnini döndürür
-    """
     workspace.mkdir(parents=True, exist_ok=True)
     endpoint = select_endpoint(config, mode_override)
-
-    # Dry-run & test/format/lint parametreleri
     dry_run_flag = config.general.dry_run_default if dry_run is None else dry_run
 
     run_tests_effective = (
@@ -831,10 +730,21 @@ def run_agent_round(
         else config.general.lint_command
     )
 
+    auto_install_effective = (
+        config.general.auto_install_missing_packages_default
+        if run_auto_install_flag is None
+        else run_auto_install_flag
+    )
+    pip_install_template = (
+        pip_install_command_override
+        if pip_install_command_override is not None
+        else config.general.pip_install_command
+    )
+
     all_actions: List[Dict[str, Any]] = []
     summary_chunks: List[str] = []
 
-    # -------- PLAN TURU (isteğe bağlı) --------
+    # -------- PLAN --------
     planner_plan_obj: Optional[Dict[str, Any]] = None
     planner_json_text_for_coder: Optional[str] = None
     planner_summary_text: Optional[str] = None
@@ -863,7 +773,7 @@ def run_agent_round(
         planner_summary_text = summarize_plan(planner_plan_obj, planner_json_text)
         summary_chunks.append("📋 Plan\n" + planner_summary_text)
 
-    # -------- CODER TURU (ilk tur) --------
+    # -------- CODER (ilk tur) --------
     coder_messages = build_coder_messages(
         task=task,
         workspace=workspace,
@@ -893,43 +803,6 @@ def run_agent_round(
         return [], final_summary
 
     all_actions.extend(actions)
-) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Tek tur:
-    - LLM'e git
-    - JSON aksiyon listesi al
-    - İstenirse workspace'e uygula
-    - Aksiyon listesini ve insan okunur özeti döndür
-    """
-    workspace.mkdir(parents=True, exist_ok=True)
-    endpoint = select_endpoint(config, mode_override)
-    messages = build_messages(task, workspace, config)
-
-    raw_output = call_llm(
-        endpoint=endpoint,
-        messages=messages,
-        temperature=config.general.temperature,
-    )
-
-    json_text = extract_json_block(raw_output)
-
-    # JSON ayrıştırma hatasında dosyalara dokunma
-    try:
-        actions = parse_actions(json_text)
-    except Exception as e:
-        summary = (
-            "❌ Model çıktısı geçersiz JSON gibi görünüyor, dosyalara dokunulmadı.\n\n"
-            f"Hata: {e}\n\n"
-            "Ham çıktı (kısaltılmış):\n"
-            f"{raw_output[:2000]}{'...' if len(raw_output) > 2000 else ''}"
-        )
-        return [], summary
-
-    # Dry-run kararı
-    if dry_run is None:
-        dry_run_flag = config.general.dry_run_default
-    else:
-        dry_run_flag = dry_run
 
     logs: List[str] = []
     if not dry_run_flag:
@@ -949,11 +822,10 @@ def run_agent_round(
     )
     summary_chunks.append(actions_summary)
 
-    # -------- FORMAT & LINT (dry-run değilse) --------
     combined_failure_info = ""
 
+    # -------- FORMAT & LINT --------
     if not dry_run_flag:
-        # Format
         if run_format_effective and format_command.strip():
             rc_f, out_f, err_f = run_generic_command(
                 workspace=workspace,
@@ -967,7 +839,6 @@ def run_agent_round(
             if rc_f != 0:
                 combined_failure_info += "\n\n[FORMAT FAILURE]\n" + fmt_summary
 
-        # Lint
         if run_lint_effective and lint_command.strip():
             rc_l, out_l, err_l = run_generic_command(
                 workspace=workspace,
@@ -981,8 +852,12 @@ def run_agent_round(
             if rc_l != 0:
                 combined_failure_info += "\n\n[LINT FAILURE]\n" + lint_summary
 
-    # -------- TESTLER (isteğe bağlı) --------
+    # -------- TESTLER + auto pip --------
     last_test_summary = ""
+    rc = 0
+    out = ""
+    err = ""
+
     if not dry_run_flag and run_tests_effective:
         rc, out, err = run_tests(
             workspace=workspace,
@@ -993,10 +868,44 @@ def run_agent_round(
         last_test_summary = test_summary
         summary_chunks.append("🧪 Test Sonucu (İlk Tur)\n" + test_summary)
 
-        # Başarılıysa bitti
+        # Auto pip install
+        if rc != 0 and auto_install_effective:
+            missing = extract_missing_module_name(out, err)
+            if missing:
+                # 'src' gibi workspace içi local modülleri pip install etme
+                if not (workspace / missing).exists():
+                    pip_cmd = pip_install_template.format(package=missing)
+                    rc_p, out_p, err_p = run_generic_command(
+                        workspace=workspace,
+                        command=pip_cmd,
+                        timeout_seconds=config.general.test_timeout_seconds,
+                    )
+                    auto_summary = summarize_generic_command_result(
+                        "Otomatik paket kurulumu", rc_p, out_p, err_p, pip_cmd
+                    )
+                    summary_chunks.append("📦 Otomatik Paket Kurulumu\n" + auto_summary)
+                    if rc_p == 0:
+                        # Kurulumdan sonra testleri tekrar çalıştır
+                        rc, out, err = run_tests(
+                            workspace=workspace,
+                            command=test_command,
+                            timeout_seconds=config.general.test_timeout_seconds,
+                        )
+                        test_summary2 = summarize_test_result(
+                            rc, out, err, test_command
+                        )
+                        last_test_summary = test_summary2
+                        summary_chunks.append(
+                            "🧪 Test Sonucu (Oto Kurulum Sonrası)\n" + test_summary2
+                        )
+                    else:
+                        combined_failure_info += (
+                            "\n\n[AUTO-INSTALL FAILURE]\n" + auto_summary
+                        )
+
+        # Eğer artık rc==0 ise fix loop’a girmeden bitir
         if rc == 0 or config.general.max_test_fix_rounds <= 0:
-            # Reviewer çağır
-            if all_actions:
+            if not dry_run_flag and all_actions:
                 review_messages = build_reviewer_messages(
                     task=task,
                     workspace=workspace,
@@ -1013,7 +922,7 @@ def run_agent_round(
             final_summary_ok = "\n\n".join(summary_chunks)
             return all_actions, final_summary_ok
 
-        # -------- TEST FIX TUR(LAR)I --------
+        # -------- TEST FIX LOOP --------
         remaining_fixes = config.general.max_test_fix_rounds
         failure_info_for_llm = last_test_summary
         if combined_failure_info.strip():
@@ -1047,7 +956,9 @@ def run_agent_round(
                     "Ham çıktı (kısaltılmış):\n"
                     f"{fix_raw_output[:2000]}{'...' if len(fix_raw_output) > 2000 else ''}"
                 )
-                summary_chunks.append(f"🛠 Test Düzeltme Turu #{fix_round_index}\n" + fix_err_summary)
+                summary_chunks.append(
+                    f"🛠 Test Düzeltme Turu #{fix_round_index}\n" + fix_err_summary
+                )
                 break
 
             all_actions.extend(fix_actions)
@@ -1060,7 +971,9 @@ def run_agent_round(
                     f"❌ Test düzeltme turu #{fix_round_index} dosya işlemlerinde hata.\n\n"
                     f"Hata: {e}"
                 )
-                summary_chunks.append(f"🛠 Test Düzeltme Turu #{fix_round_index}\n" + fix_err2)
+                summary_chunks.append(
+                    f"🛠 Test Düzeltme Turu #{fix_round_index}\n" + fix_err2
+                )
                 break
 
             fix_actions_summary = summarize_actions(
@@ -1089,7 +1002,7 @@ def run_agent_round(
             failure_info_for_llm = test_summary2
             fix_round_index += 1
 
-    # -------- Reviewer (dry-run değilse) --------
+    # -------- Reviewer --------
     if not dry_run_flag and all_actions:
         review_messages = build_reviewer_messages(
             task=task,
@@ -1106,11 +1019,3 @@ def run_agent_round(
 
     final_summary = "\n\n".join(summary_chunks)
     return all_actions, final_summary
-            summary = (
-                "❌ Dosya işlemlerinde hata oluştu.\n\n"
-                f"Hata: {e}"
-            )
-            return actions, summary
-
-    summary = summarize_actions(actions, logs, dry_run=dry_run_flag)
-    return actions, summary
