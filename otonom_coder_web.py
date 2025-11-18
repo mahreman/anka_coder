@@ -1,7 +1,22 @@
 #!/usr/bin/env python
 """
-Streamlit tabanlı web arayüzü
-(plan → apply + test fix + format/lint + review + auto pip install, v6).
+Streamlit tabanlı web arayüzü (plan → apply + test fix + format/lint + review, v5).
+Streamlit tabanlı web arayüzü (v2).
+
+Özellikler:
+- Chat arayüzü ile görev verme
+- Cloud / local mod seçimi
+- Workspace klasörü seçimi / oluşturma
+- Dry-run togglesi (dosyalara dokunma)
+- Format ve lint komutlarını koşturma (black, ruff vs.)
+- Testleri çalıştırma (pytest vb.) + oto-fix döngüsü
+- Workspace hafızası (.otonom_memory.md) okuma/yazma
+- Manuel komut paneli (workspace içinde istediğin komutu çalıştır)
+- Son dosya aksiyonlarını detaylı görme
+- Planner + Coder + Format/Lint + Test + Review çıktısını tek mesajda görme
+- Dry-run togglesi (sadece simülasyon vs gerçek yazma)
+- Son dosya aksiyonlarını detaylı görme
+- Workspace dosya gezgini (dosya seç → içeriğini gör)
 """
 
 from pathlib import Path
@@ -50,10 +65,6 @@ def init_session_state() -> None:
         st.session_state["run_lint"] = False
     if "lint_command" not in st.session_state:
         st.session_state["lint_command"] = "ruff ."
-    if "auto_install" not in st.session_state:
-        st.session_state["auto_install"] = True
-    if "pip_install_command" not in st.session_state:
-        st.session_state["pip_install_command"] = "pip install {package}"
     if "selected_file" not in st.session_state:
         st.session_state["selected_file"] = ""
     if "workspace_memory_text" not in st.session_state:
@@ -62,6 +73,8 @@ def init_session_state() -> None:
         st.session_state["manual_command"] = "pytest"
     if "manual_command_history" not in st.session_state:
         st.session_state["manual_command_history"]: List[str] = []
+    if "selected_file" not in st.session_state:
+        st.session_state["selected_file"] = ""
 
 
 def load_config_safe(config_path: str) -> AppConfig:
@@ -112,7 +125,8 @@ def main() -> None:
 
     st.title("🧠 Otonom Coder (Qwen3-Coder + Ollama)")
 
-    # Sidebar: config, mod, workspace, dry-run, format/lint/test/auto-install
+    # Sidebar: config, mod, workspace, dry-run, format/lint/test
+    # Sidebar: config, mod, workspace, dry-run
     with st.sidebar:
         st.header("⚙️ Ayarlar")
 
@@ -135,8 +149,6 @@ def main() -> None:
                 st.session_state["format_command"] = cfg.general.format_command
                 st.session_state["run_lint"] = cfg.general.run_lint_default
                 st.session_state["lint_command"] = cfg.general.lint_command
-                st.session_state["auto_install"] = cfg.general.auto_install_missing_packages_default
-                st.session_state["pip_install_command"] = cfg.general.pip_install_command
                 st.success("Config yüklendi.")
             except Exception as e:
                 st.session_state["config"] = None
@@ -166,6 +178,7 @@ def main() -> None:
 
         dry_run_flag = st.checkbox(
             "Dry-run (dosyalara dokunma, sadece plan/aksiyon üret)",
+            "Dry-run (dosyalara dokunma, sadece plan üret)",
             value=st.session_state["dry_run"],
         )
         st.session_state["dry_run"] = dry_run_flag
@@ -211,27 +224,13 @@ def main() -> None:
         )
         st.session_state["lint_command"] = lint_cmd
 
-        st.markdown("### Auto pip install")
-
-        auto_install_flag = st.checkbox(
-            "ModuleNotFoundError için eksik paketi otomatik `pip install` et",
-            value=st.session_state["auto_install"],
-        )
-        st.session_state["auto_install"] = auto_install_flag
-
-        pip_cmd_template = st.text_input(
-            "pip install komutu",
-            value=st.session_state["pip_install_command"],
-            help="Örn: pip install {package}  (package yeri otomatik doldurulacak)",
-        )
-        st.session_state["pip_install_command"] = pip_cmd_template
-
         st.markdown("---")
         st.caption("Görevleri aşağıdaki sohbet kutusundan yaz.")
 
     cfg: Optional[AppConfig] = st.session_state["config"]
 
-    # Üst bilgi + explorer
+    # Üst bilgi, workspace explorer ve hafıza + komut paneli
+    # Üst bilgi ve workspace explorer
     col1, col2 = st.columns([2, 2])
 
     with col1:
@@ -256,14 +255,16 @@ def main() -> None:
             st.write(f"**Test komutu:** `{st.session_state['test_command']}`")
             st.write(f"**Format komutu:** `{st.session_state['format_command']}` (aktif: {st.session_state['run_format']})")
             st.write(f"**Lint komutu:** `{st.session_state['lint_command']}` (aktif: {st.session_state['run_lint']})")
-            st.write(f"**Auto pip install:** `{st.session_state['auto_install']}`")
-            st.write(f"**pip komut şablonu:** `{st.session_state['pip_install_command']}`")
             st.write(
                 f"**Max test fix turu:** `{cfg.general.max_test_fix_rounds}`"
             )
 
         st.markdown(
-            "_ModuleNotFoundError gördüğünde, auto-install açıksa eksik paketi pip ile yükleyip testleri tekrar dener._"
+            "_İpucu: max_rounds ≥ 2 ise her görevde önce plan çıkar, sonra dosya aksiyonları üretilir; "
+            "format/lint/test açık ise hata varsa kendisi düzeltmeye çalışır._"
+
+        st.markdown(
+            "_İpucu: Aynı proje üzerinde birden fazla görev vererek adım adım geliştirebilirsin._"
         )
 
     with col2:
@@ -287,6 +288,7 @@ def main() -> None:
                     content = target.read_text(encoding="utf-8")
                 except Exception as e:
                     content = f"Dosya okunamadı: {e}"
+                # Dil tahmini yok; çoğu kod olacağı için python bırakıyorum
                 st.code(content, language="python")
 
     st.markdown("---")
@@ -359,14 +361,17 @@ def main() -> None:
     user_input = st.chat_input(
         "Görevini yaz (ör: Basit bir FastAPI projesi kur, testler pytest ile çalışsın)."
     )
+    user_input = st.chat_input("Görevini yaz (ör: Basit bir FastAPI projesi kur).")
 
     if user_input and cfg is not None:
+        # Kullanıcı mesajını ekle
         st.session_state["messages"].append(
             {"role": "user", "content": user_input}
         )
         with st.chat_message("user"):
             st.markdown(user_input)
 
+        # Agent çalıştır
         workspace_path = Path(st.session_state["workspace"])
         dry_run_flag = st.session_state["dry_run"]
         run_tests_flag = st.session_state["run_tests"]
@@ -375,14 +380,16 @@ def main() -> None:
         fmt_cmd = st.session_state["format_command"]
         run_lint_flag = st.session_state["run_lint"]
         lint_cmd = st.session_state["lint_command"]
-        auto_install_flag = st.session_state["auto_install"]
-        pip_cmd_template = st.session_state["pip_install_command"]
 
         with st.chat_message("assistant"):
             placeholder = st.empty()
             placeholder.markdown(
-                "_Görev işleniyor: plan → kod → (format/lint) → (opsiyonel) test → (gerekirse) auto pip install + düzeltme → review..._"
+                "_Görev işleniyor: plan → kod → (format/lint) → (opsiyonel) test → (gerekirse) düzeltme → review..._"
             )
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("_Görev işleniyor, dosyalar hazırlanıyor..._")
 
             try:
                 actions, summary = run_agent_round(
@@ -397,8 +404,6 @@ def main() -> None:
                     format_command_override=fmt_cmd,
                     run_lint_flag=run_lint_flag,
                     lint_command_override=lint_cmd,
-                    run_auto_install_flag=auto_install_flag,
-                    pip_install_command_override=pip_cmd_template,
                 )
                 st.session_state["last_actions"] = actions
                 placeholder.markdown(summary)
@@ -412,6 +417,7 @@ def main() -> None:
                     {"role": "assistant", "content": error_text}
                 )
 
+    # Son aksiyonları tabloda göster
     st.markdown("---")
     st.subheader("Son Dosya Aksiyonları")
 
