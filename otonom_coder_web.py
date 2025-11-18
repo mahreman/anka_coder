@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
 Streamlit tabanlı web arayüzü (plan → apply + test fix + format/lint + review, v5).
+Streamlit tabanlı web arayüzü (v2).
 
 Özellikler:
 - Chat arayüzü ile görev verme
@@ -13,6 +14,9 @@ Streamlit tabanlı web arayüzü (plan → apply + test fix + format/lint + revi
 - Manuel komut paneli (workspace içinde istediğin komutu çalıştır)
 - Son dosya aksiyonlarını detaylı görme
 - Planner + Coder + Format/Lint + Test + Review çıktısını tek mesajda görme
+- Dry-run togglesi (sadece simülasyon vs gerçek yazma)
+- Son dosya aksiyonlarını detaylı görme
+- Workspace dosya gezgini (dosya seç → içeriğini gör)
 """
 
 from pathlib import Path
@@ -69,6 +73,8 @@ def init_session_state() -> None:
         st.session_state["manual_command"] = "pytest"
     if "manual_command_history" not in st.session_state:
         st.session_state["manual_command_history"]: List[str] = []
+    if "selected_file" not in st.session_state:
+        st.session_state["selected_file"] = ""
 
 
 def load_config_safe(config_path: str) -> AppConfig:
@@ -120,6 +126,7 @@ def main() -> None:
     st.title("🧠 Otonom Coder (Qwen3-Coder + Ollama)")
 
     # Sidebar: config, mod, workspace, dry-run, format/lint/test
+    # Sidebar: config, mod, workspace, dry-run
     with st.sidebar:
         st.header("⚙️ Ayarlar")
 
@@ -171,6 +178,7 @@ def main() -> None:
 
         dry_run_flag = st.checkbox(
             "Dry-run (dosyalara dokunma, sadece plan/aksiyon üret)",
+            "Dry-run (dosyalara dokunma, sadece plan üret)",
             value=st.session_state["dry_run"],
         )
         st.session_state["dry_run"] = dry_run_flag
@@ -222,6 +230,7 @@ def main() -> None:
     cfg: Optional[AppConfig] = st.session_state["config"]
 
     # Üst bilgi, workspace explorer ve hafıza + komut paneli
+    # Üst bilgi ve workspace explorer
     col1, col2 = st.columns([2, 2])
 
     with col1:
@@ -253,6 +262,9 @@ def main() -> None:
         st.markdown(
             "_İpucu: max_rounds ≥ 2 ise her görevde önce plan çıkar, sonra dosya aksiyonları üretilir; "
             "format/lint/test açık ise hata varsa kendisi düzeltmeye çalışır._"
+
+        st.markdown(
+            "_İpucu: Aynı proje üzerinde birden fazla görev vererek adım adım geliştirebilirsin._"
         )
 
     with col2:
@@ -349,6 +361,7 @@ def main() -> None:
     user_input = st.chat_input(
         "Görevini yaz (ör: Basit bir FastAPI projesi kur, testler pytest ile çalışsın)."
     )
+    user_input = st.chat_input("Görevini yaz (ör: Basit bir FastAPI projesi kur).")
 
     if user_input and cfg is not None:
         # Kullanıcı mesajını ekle
@@ -373,6 +386,10 @@ def main() -> None:
             placeholder.markdown(
                 "_Görev işleniyor: plan → kod → (format/lint) → (opsiyonel) test → (gerekirse) düzeltme → review..._"
             )
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            placeholder.markdown("_Görev işleniyor, dosyalar hazırlanıyor..._")
 
             try:
                 actions, summary = run_agent_round(

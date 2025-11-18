@@ -23,6 +23,17 @@ Qwen3-Coder + Ollama ile otonom coder agent (plan → apply + test fix + format/
 
 import json
 import subprocess
+Qwen3-Coder + Ollama ile otonom coder agent (v2).
+
+Bu modül:
+- Config'i okur
+- Qwen3-Coder'a prompt atar
+- JSON formatında dosya aksiyonları alır
+- İstenirse workspace içinde dosyaları GERÇEKTEN yazar/siler (dry-run destekli)
+- Özet string döndürür (web UI'de chat mesajı olarak gösterilecek)
+"""
+
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -96,6 +107,7 @@ def load_config(config_path: Path) -> AppConfig:
         default_workspace=str(general_raw.get("default_workspace", "./workspace")),
         temperature=float(general_raw.get("temperature", 0.1)),
         max_rounds=int(general_raw.get("max_rounds", 2)),
+        max_rounds=int(general_raw.get("max_rounds", 1)),
         max_files_in_tree=int(general_raw.get("max_files_in_tree", 150)),
         max_preview_bytes_per_file=int(
             general_raw.get("max_preview_bytes_per_file", 2000)
@@ -222,6 +234,17 @@ You ONLY work inside a given workspace directory and you have FULL control over 
 * You can create, overwrite, and delete files.
 * You must ALWAYS write full file contents (never patches, never diffs).
 * Prefer the simplest, most robust solution.
+# ---------------------------------------------------------------------------
+# Prompt & LLM çağrısı
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are an autonomous coding agent similar to Claude Coder / OpenAI Codex.
+
+You ONLY work inside a given workspace directory and you have FULL control over files:
+- You can create, overwrite, and delete files.
+- You must ALWAYS write full file contents (never patches, never diffs).
+- Prefer the simplest, most robust solution.
 
 ### GOAL
 
@@ -240,6 +263,14 @@ You must:
 2. If failure info is provided, focus on fixing the failure while preserving existing working code as much as possible.
 3. Decide the minimal set of files to create/update/delete to complete the task.
 4. Output a JSON array describing the file operations.
+- A natural language task.
+- The absolute path of the workspace directory.
+- A file tree overview of the current workspace (relative paths).
+
+You must:
+1. Understand the task.
+2. Decide the minimal set of files to create/update/delete to complete the task.
+3. Output a JSON array describing the file operations.
 
 ### FILE OPERATIONS FORMAT
 
@@ -370,6 +401,24 @@ def build_reviewer_messages(
     if memory_text.strip():
         memory_part = "\n\nWorkspace memory:\n" + memory_text + "\n"
 
+def get_workspace_overview(workspace: Path, max_files: int) -> str:
+    """
+    Workspace içindeki dosya ağacını kısa bir metin olarak çıkar.
+    Modeller için bağlam verir.
+    """
+    items: List[str] = []
+    for p in workspace.rglob("*"):
+        if p.is_file():
+            rel = p.relative_to(workspace)
+            items.append(str(rel))
+        if len(items) >= max_files:
+            break
+    if not items:
+        return "(empty workspace)"
+    return "\n".join(items)
+
+def build_messages(task: str, workspace: Path, cfg: AppConfig) -> List[Dict[str, Any]]:
+    file_tree = get_workspace_overview(workspace, cfg.general.max_files_in_tree)
     user_content = (
         "Workspace absolute path:\n"
         f"{str(workspace.resolve())}\n\n"
@@ -384,6 +433,12 @@ def build_reviewer_messages(
 
     return [
         {"role": "system", "content": REVIEWER_SYSTEM_PROMPT.strip()},
+        f"{file_tree}\n\n"
+        "Task:\n"
+        f"{task}"
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT.strip()},
         {"role": "user", "content": user_content},
     ]
 
@@ -405,6 +460,10 @@ def call_llm(
     )
     # Ollama python client dict döndürür: {"message": {"content": "..."}}
     return response["message"]["content"]  # type: ignore[index]
+
+# ---------------------------------------------------------------------------
+# JSON blok ayıklama & dosya işlemleri
+# ---------------------------------------------------------------------------
 
 def extract_json_block(text: str) -> str:
     """
@@ -657,6 +716,12 @@ def summarize_actions(
         if dry_run:
             base = "🟡 DRY-RUN (dosyalara dokunulmadı)\n\n" + base
         return (header_prefix + "\n" if header_prefix else "") + base
+) -> str:
+    """
+    Web chat'te gösterilecek kısa özet.
+    """
+    if not actions:
+        return "Herhangi bir dosya değişikliği gerekmedi."
 
     write_count = 0
     delete_count = 0
@@ -684,6 +749,9 @@ def summarize_actions(
         if dry_run
         else f"{write_count} dosya yazıldı, {delete_count} dosya silindi."
     )
+    header = f"{write_count} dosya yazılacak, {delete_count} dosya silinecek."
+    if not dry_run:
+        header = f"{write_count} dosya yazıldı, {delete_count} dosya silindi."
 
     result = header + "\n" + "\n".join(lines)
 
@@ -703,6 +771,7 @@ def summarize_actions(
 
 # ---------------------------------------------------------------------------
 # Planner + Coder + Format/Lint + Test + Review ana fonksiyon
+# Dışarı açılan ana fonksiyon
 # ---------------------------------------------------------------------------
 
 def run_agent_round(
@@ -824,6 +893,43 @@ def run_agent_round(
         return [], final_summary
 
     all_actions.extend(actions)
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Tek tur:
+    - LLM'e git
+    - JSON aksiyon listesi al
+    - İstenirse workspace'e uygula
+    - Aksiyon listesini ve insan okunur özeti döndür
+    """
+    workspace.mkdir(parents=True, exist_ok=True)
+    endpoint = select_endpoint(config, mode_override)
+    messages = build_messages(task, workspace, config)
+
+    raw_output = call_llm(
+        endpoint=endpoint,
+        messages=messages,
+        temperature=config.general.temperature,
+    )
+
+    json_text = extract_json_block(raw_output)
+
+    # JSON ayrıştırma hatasında dosyalara dokunma
+    try:
+        actions = parse_actions(json_text)
+    except Exception as e:
+        summary = (
+            "❌ Model çıktısı geçersiz JSON gibi görünüyor, dosyalara dokunulmadı.\n\n"
+            f"Hata: {e}\n\n"
+            "Ham çıktı (kısaltılmış):\n"
+            f"{raw_output[:2000]}{'...' if len(raw_output) > 2000 else ''}"
+        )
+        return [], summary
+
+    # Dry-run kararı
+    if dry_run is None:
+        dry_run_flag = config.general.dry_run_default
+    else:
+        dry_run_flag = dry_run
 
     logs: List[str] = []
     if not dry_run_flag:
@@ -1000,3 +1106,11 @@ def run_agent_round(
 
     final_summary = "\n\n".join(summary_chunks)
     return all_actions, final_summary
+            summary = (
+                "❌ Dosya işlemlerinde hata oluştu.\n\n"
+                f"Hata: {e}"
+            )
+            return actions, summary
+
+    summary = summarize_actions(actions, logs, dry_run=dry_run_flag)
+    return actions, summary
